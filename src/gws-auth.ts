@@ -28,7 +28,10 @@ export function decryptGwsCredentials(): GwsCredentials | null {
     const ciphertext = enc.subarray(12, -16);
     const decipher = createDecipheriv('aes-256-gcm', key, iv);
     decipher.setAuthTag(authTag);
-    const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+    const decrypted = Buffer.concat([
+      decipher.update(ciphertext),
+      decipher.final(),
+    ]);
     return JSON.parse(decrypted.toString());
   } catch {
     return null;
