@@ -28,17 +28,12 @@ export interface ProxyConfig {
   authMode: AuthMode;
 }
 
-/**
- * GET /google/token — returns a fresh Google OAuth access token as plain text.
- * Called by the gws wrapper script inside containers before each gws invocation.
- */
-function handleGoogleToken(_req: IncomingMessage, res: ServerResponse): void {
+let gwsTokenCache: { token: string; expiresAt: number } | null = null;
+const GWS_TOKEN_REFRESH_MARGIN_MS = 5 * 60 * 1000; // refresh 5 min before expiry
+
+function fetchGoogleToken(): Promise<string> {
   const creds = decryptGwsCredentials();
-  if (!creds) {
-    res.writeHead(503);
-    res.end('');
-    return;
-  }
+  if (!creds) return Promise.resolve('');
 
   const body = new URLSearchParams({
     client_id: creds.client_id,
@@ -47,43 +42,70 @@ function handleGoogleToken(_req: IncomingMessage, res: ServerResponse): void {
     grant_type: 'refresh_token',
   }).toString();
 
-  const upstream = httpsRequest(
-    {
-      hostname: 'oauth2.googleapis.com',
-      path: '/token',
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Content-Length': Buffer.byteLength(body),
+  return new Promise((resolve) => {
+    const upstream = httpsRequest(
+      {
+        hostname: 'oauth2.googleapis.com',
+        path: '/token',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Content-Length': Buffer.byteLength(body),
+        },
       },
-    },
-    (upRes) => {
-      const chunks: Buffer[] = [];
-      upRes.on('data', (c) => chunks.push(c));
-      upRes.on('end', () => {
-        try {
-          const data = JSON.parse(Buffer.concat(chunks).toString());
-          const token = data.access_token ?? '';
-          res.writeHead(token ? 200 : 502, { 'Content-Type': 'text/plain' });
-          res.end(token);
-        } catch {
-          res.writeHead(502);
-          res.end('');
-        }
-      });
-    },
-  );
-
-  upstream.on('error', (err) => {
-    logger.error({ err }, 'Google token refresh upstream error');
-    if (!res.headersSent) {
-      res.writeHead(502);
-      res.end('');
-    }
+      (upRes) => {
+        const chunks: Buffer[] = [];
+        upRes.on('data', (c) => chunks.push(c));
+        upRes.on('end', () => {
+          try {
+            const data = JSON.parse(Buffer.concat(chunks).toString());
+            const token: string = data.access_token ?? '';
+            const expiresIn: number = data.expires_in ?? 3600;
+            if (token) {
+              gwsTokenCache = {
+                token,
+                expiresAt: Date.now() + expiresIn * 1000,
+              };
+            }
+            resolve(token);
+          } catch {
+            resolve('');
+          }
+        });
+      },
+    );
+    upstream.on('error', (err) => {
+      logger.error({ err }, 'Google token refresh upstream error');
+      resolve('');
+    });
+    upstream.write(body);
+    upstream.end();
   });
+}
 
-  upstream.write(body);
-  upstream.end();
+/**
+ * GET /google/token — returns a cached Google OAuth access token as plain text,
+ * refreshing from Google when the token is missing or within 5 min of expiry.
+ * Called by the gws wrapper script inside containers before each gws invocation.
+ */
+async function handleGoogleToken(
+  _req: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> {
+  if (!decryptGwsCredentials()) {
+    res.writeHead(503);
+    res.end('');
+    return;
+  }
+
+  const needsRefresh =
+    !gwsTokenCache ||
+    gwsTokenCache.expiresAt - Date.now() < GWS_TOKEN_REFRESH_MARGIN_MS;
+
+  const token = needsRefresh ? await fetchGoogleToken() : gwsTokenCache!.token;
+
+  res.writeHead(token ? 200 : 502, { 'Content-Type': 'text/plain' });
+  res.end(token);
 }
 
 export function startCredentialProxy(
@@ -114,7 +136,9 @@ export function startCredentialProxy(
       req.on('end', () => {
         // Google token endpoint — gws wrapper fetches a fresh access token here.
         if (req.method === 'GET' && req.url === '/google/token') {
-          handleGoogleToken(req, res);
+          handleGoogleToken(req, res).catch((err) =>
+            logger.error({ err }, 'Google token handler error'),
+          );
           return;
         }
 
