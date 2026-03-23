@@ -33,6 +33,15 @@ ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 # Install agent-browser, claude-code, and gws (Google Workspace CLI)
 RUN npm install -g agent-browser @anthropic-ai/claude-code @googleworkspace/cli
 
+# Wrap gws so it fetches a fresh token from the credential proxy before each call.
+# GWS_TOKEN_URL is injected at container start when gws is configured on the host.
+RUN gws_target=$(node -e "console.log(require('fs').realpathSync('/usr/local/bin/gws'))") \
+ && mv "$gws_target" "$(dirname "$gws_target")/gws-bin" \
+ && rm /usr/local/bin/gws \
+ && ln -s "$(dirname "$gws_target")/gws-bin" /usr/local/bin/gws-bin \
+ && printf '#!/bin/sh\nif [ -n "$GWS_TOKEN_URL" ]; then\n  TOKEN=$(curl -sf "$GWS_TOKEN_URL")\n  [ -n "$TOKEN" ] && exec env GOOGLE_WORKSPACE_CLI_TOKEN="$TOKEN" /usr/local/bin/gws-bin "$@"\nfi\nexec /usr/local/bin/gws-bin "$@"\n' > /usr/local/bin/gws \
+ && chmod +x /usr/local/bin/gws
+
 # Create app directory
 WORKDIR /app
 

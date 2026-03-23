@@ -9,18 +9,81 @@
  *             API key via /api/oauth/claude_cli/create_api_key.
  *             Proxy injects real OAuth token on that exchange request;
  *             subsequent requests carry the temp key which is valid as-is.
+ *
+ * Google Workspace token refresh:
+ *   POST /google/token — containers send placeholder credentials here;
+ *   proxy substitutes real gws credentials before forwarding to Google.
  */
-import { createServer, Server } from 'http';
+import { createServer, IncomingMessage, Server, ServerResponse } from 'http';
 import { request as httpsRequest } from 'https';
 import { request as httpRequest, RequestOptions } from 'http';
 
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
+import { decryptGwsCredentials } from './gws-auth.js';
 
 export type AuthMode = 'api-key' | 'oauth';
 
 export interface ProxyConfig {
   authMode: AuthMode;
+}
+
+/**
+ * GET /google/token — returns a fresh Google OAuth access token as plain text.
+ * Called by the gws wrapper script inside containers before each gws invocation.
+ */
+function handleGoogleToken(_req: IncomingMessage, res: ServerResponse): void {
+  const creds = decryptGwsCredentials();
+  if (!creds) {
+    res.writeHead(503);
+    res.end('');
+    return;
+  }
+
+  const body = new URLSearchParams({
+    client_id: creds.client_id,
+    client_secret: creds.client_secret,
+    refresh_token: creds.refresh_token,
+    grant_type: 'refresh_token',
+  }).toString();
+
+  const upstream = httpsRequest(
+    {
+      hostname: 'oauth2.googleapis.com',
+      path: '/token',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(body),
+      },
+    },
+    (upRes) => {
+      const chunks: Buffer[] = [];
+      upRes.on('data', (c) => chunks.push(c));
+      upRes.on('end', () => {
+        try {
+          const data = JSON.parse(Buffer.concat(chunks).toString());
+          const token = data.access_token ?? '';
+          res.writeHead(token ? 200 : 502, { 'Content-Type': 'text/plain' });
+          res.end(token);
+        } catch {
+          res.writeHead(502);
+          res.end('');
+        }
+      });
+    },
+  );
+
+  upstream.on('error', (err) => {
+    logger.error({ err }, 'Google token refresh upstream error');
+    if (!res.headersSent) {
+      res.writeHead(502);
+      res.end('');
+    }
+  });
+
+  upstream.write(body);
+  upstream.end();
 }
 
 export function startCredentialProxy(
@@ -49,6 +112,12 @@ export function startCredentialProxy(
       const chunks: Buffer[] = [];
       req.on('data', (c) => chunks.push(c));
       req.on('end', () => {
+        // Google token endpoint — gws wrapper fetches a fresh access token here.
+        if (req.method === 'GET' && req.url === '/google/token') {
+          handleGoogleToken(req, res);
+          return;
+        }
+
         const body = Buffer.concat(chunks);
         const headers: Record<string, string | number | string[] | undefined> =
           {
