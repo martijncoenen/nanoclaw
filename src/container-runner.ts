@@ -4,6 +4,8 @@
  */
 import { ChildProcess, exec, spawn } from 'child_process';
 import fs from 'fs';
+import { request as httpsRequest } from 'https';
+import os from 'os';
 import path from 'path';
 
 import {
@@ -212,9 +214,72 @@ function buildVolumeMounts(
   return mounts;
 }
 
+/**
+ * Get a short-lived Google OAuth access token by decrypting gws credentials
+ * and exchanging the refresh token. Returns null if gws is not configured.
+ */
+async function getGoogleWorkspaceToken(): Promise<string | null> {
+  const gwsDir = path.join(os.homedir(), '.config/gws');
+  const encFile = path.join(gwsDir, 'credentials.enc');
+  const keyFile = path.join(gwsDir, '.encryption_key');
+  if (!fs.existsSync(encFile) || !fs.existsSync(keyFile)) return null;
+
+  let creds: { client_id: string; client_secret: string; refresh_token: string };
+  try {
+    const { createDecipheriv } = await import('crypto');
+    const key = Buffer.from(fs.readFileSync(keyFile, 'utf8').trim(), 'base64');
+    const enc = fs.readFileSync(encFile);
+    const iv = enc.subarray(0, 12);
+    const authTag = enc.subarray(-16);
+    const ciphertext = enc.subarray(12, -16);
+    const decipher = createDecipheriv('aes-256-gcm', key, iv);
+    decipher.setAuthTag(authTag);
+    const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+    creds = JSON.parse(decrypted.toString());
+  } catch {
+    return null;
+  }
+
+  return new Promise((resolve) => {
+    const body = JSON.stringify({
+      client_id: creds.client_id,
+      client_secret: creds.client_secret,
+      refresh_token: creds.refresh_token,
+      grant_type: 'refresh_token',
+    });
+    const req = httpsRequest(
+      {
+        hostname: 'oauth2.googleapis.com',
+        path: '/token',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body),
+        },
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (c: Buffer) => chunks.push(c));
+        res.on('end', () => {
+          try {
+            const data = JSON.parse(Buffer.concat(chunks).toString());
+            resolve(data.access_token ?? null);
+          } catch {
+            resolve(null);
+          }
+        });
+      },
+    );
+    req.on('error', () => resolve(null));
+    req.write(body);
+    req.end();
+  });
+}
+
 function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
+  googleToken?: string,
 ): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
@@ -236,6 +301,10 @@ function buildContainerArgs(
     args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
   } else {
     args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
+  }
+
+  if (googleToken) {
+    args.push('-e', `GOOGLE_WORKSPACE_CLI_TOKEN=${googleToken}`);
   }
 
   // Runtime-specific args for host gateway resolution
@@ -278,7 +347,8 @@ export async function runContainerAgent(
   const mounts = buildVolumeMounts(group, input.isMain);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
-  const containerArgs = buildContainerArgs(mounts, containerName);
+  const googleToken = await getGoogleWorkspaceToken() ?? undefined;
+  const containerArgs = buildContainerArgs(mounts, containerName, googleToken);
 
   logger.debug(
     {
