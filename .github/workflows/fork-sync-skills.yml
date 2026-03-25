@@ -156,26 +156,33 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title: `Upstream sync failed — merge conflict or build failure`,
-              body: [
-                'The automated sync with `qwibitai/nanoclaw` main failed.',
-                '',
-                'This usually means upstream made changes that conflict with this fork\'s channel code.',
-                '',
-                'To resolve manually:',
-                '```bash',
-                'git fetch upstream main',
-                'git merge upstream/main',
-                '# resolve conflicts',
-                'npm run build && npm test',
-                'git push',
-                '```',
-              ].join('\n'),
-              labels: ['upstream-sync']
-            });
+            const body = [
+              'The automated sync with `qwibitai/nanoclaw` main failed.',
+              '',
+              'This usually means upstream made changes that conflict with this fork\'s channel code.',
+              '',
+              'To resolve manually:',
+              '```bash',
+              'git fetch upstream main',
+              'git merge upstream/main',
+              '# resolve conflicts',
+              'npm run build && npm test',
+              'git push',
+              '```',
+            ].join('\n');
+            try {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `Upstream sync failed — merge conflict or build failure`,
+                body,
+                labels: ['upstream-sync']
+              });
+            } catch (e) {
+              core.warning(`Could not create issue (Issues may be disabled): ${e.message}`);
+              core.summary.addRaw('## Upstream sync failed\n\n' + body);
+              await core.summary.write();
+            }
 
       - name: Open issue for failed skill merges
         if: steps.merge.outputs.failed != ''
@@ -198,11 +205,16 @@ jobs:
               ]).flat(),
               '```',
             ].join('\n');
-
-            await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title: `Merge-forward failed for ${failed.length} skill branch(es)`,
-              body,
-              labels: ['skill-maintenance']
-            });
+            try {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `Merge-forward failed for ${failed.length} skill branch(es)`,
+                body,
+                labels: ['skill-maintenance']
+              });
+            } catch (e) {
+              core.warning(`Could not create issue (Issues may be disabled): ${e.message}`);
+              core.summary.addRaw('## Merge-forward failed\n\n' + body);
+              await core.summary.write();
+            }
