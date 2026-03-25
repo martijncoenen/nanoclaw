@@ -10,17 +10,98 @@
  *             Proxy injects real OAuth token on that exchange request;
  *             subsequent requests carry the temp key which is valid as-is.
  */
-import { createServer, Server } from 'http';
+import { createServer, IncomingMessage, Server, ServerResponse } from 'http';
 import { request as httpsRequest } from 'https';
 import { request as httpRequest, RequestOptions } from 'http';
 
 import { readEnvFile } from './env.js';
+import { decryptGwsCredentials } from './gws-auth.js';
 import { logger } from './logger.js';
 
 export type AuthMode = 'api-key' | 'oauth';
 
 export interface ProxyConfig {
   authMode: AuthMode;
+}
+
+let gwsTokenCache: { token: string; expiresAt: number } | null = null;
+const GWS_TOKEN_REFRESH_MARGIN_MS = 5 * 60 * 1000; // refresh 5 min before expiry
+
+function fetchGoogleToken(): Promise<string> {
+  const creds = decryptGwsCredentials();
+  if (!creds) return Promise.resolve('');
+
+  const body = new URLSearchParams({
+    client_id: creds.client_id,
+    client_secret: creds.client_secret,
+    refresh_token: creds.refresh_token,
+    grant_type: 'refresh_token',
+  }).toString();
+
+  return new Promise((resolve) => {
+    const upstream = httpsRequest(
+      {
+        hostname: 'oauth2.googleapis.com',
+        path: '/token',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Content-Length': Buffer.byteLength(body),
+        },
+      },
+      (upRes) => {
+        const chunks: Buffer[] = [];
+        upRes.on('data', (c) => chunks.push(c));
+        upRes.on('end', () => {
+          try {
+            const data = JSON.parse(Buffer.concat(chunks).toString());
+            const token: string = data.access_token ?? '';
+            const expiresIn: number = data.expires_in ?? 3600;
+            if (token) {
+              gwsTokenCache = {
+                token,
+                expiresAt: Date.now() + expiresIn * 1000,
+              };
+            }
+            resolve(token);
+          } catch {
+            resolve('');
+          }
+        });
+      },
+    );
+    upstream.on('error', (err) => {
+      logger.error({ err }, 'Google token refresh upstream error');
+      resolve('');
+    });
+    upstream.write(body);
+    upstream.end();
+  });
+}
+
+/**
+ * GET /google/token — returns a cached Google OAuth access token as plain text,
+ * refreshing from Google when the token is missing or within 5 min of expiry.
+ * Called by the gws wrapper script inside containers before each gws invocation.
+ */
+async function handleGoogleToken(
+  _req: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> {
+  if (!decryptGwsCredentials()) {
+    res.writeHead(503);
+    res.end('');
+    return;
+  }
+
+  const needsRefresh =
+    !gwsTokenCache ||
+    gwsTokenCache.expiresAt - Date.now() < GWS_TOKEN_REFRESH_MARGIN_MS;
+
+  const token = needsRefresh ? await fetchGoogleToken() : gwsTokenCache!.token;
+
+  res.writeHead(token ? 200 : 502, { 'Content-Type': 'text/plain' });
+  res.end(token);
 }
 
 export function startCredentialProxy(
@@ -49,6 +130,14 @@ export function startCredentialProxy(
       const chunks: Buffer[] = [];
       req.on('data', (c) => chunks.push(c));
       req.on('end', () => {
+        // Google token endpoint — gws wrapper fetches a fresh access token here.
+        if (req.method === 'GET' && req.url === '/google/token') {
+          handleGoogleToken(req, res).catch((err) =>
+            logger.error({ err }, 'Google token handler error'),
+          );
+          return;
+        }
+
         const body = Buffer.concat(chunks);
         const headers: Record<string, string | number | string[] | undefined> =
           {
