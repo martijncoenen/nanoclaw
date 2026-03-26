@@ -26,6 +26,7 @@ import {
   stopContainer,
 } from './container-runtime.js';
 import { detectAuthMode } from './credential-proxy.js';
+import { decryptGwsCredentials } from './gws-auth.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
 
@@ -236,6 +237,14 @@ function buildContainerArgs(
     args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
   } else {
     args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
+  }
+
+  // GWS token endpoint — containers fetch a Google OAuth token here for gws CLI calls.
+  if (decryptGwsCredentials()) {
+    args.push(
+      '-e',
+      `GWS_TOKEN_URL=http://${CONTAINER_HOST_GATEWAY}:${CREDENTIAL_PROXY_PORT}/google/token`,
+    );
   }
 
   // Runtime-specific args for host gateway resolution
