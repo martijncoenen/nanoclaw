@@ -38,7 +38,14 @@ function fetchGwsAccessToken(): Promise<string | null> {
         res.on('data', (c) => chunks.push(c));
         res.on('end', () => {
           try {
-            const data = JSON.parse(Buffer.concat(chunks).toString());
+            const raw = Buffer.concat(chunks).toString();
+            const data = JSON.parse(raw);
+            if (!data.access_token) {
+              logger.warn(
+                { googleError: raw },
+                'GWS token refresh: Google returned no access_token',
+              );
+            }
             resolve(data.access_token ?? null);
           } catch {
             resolve(null);
