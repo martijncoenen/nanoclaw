@@ -60,10 +60,6 @@ export const ONECLI_API_KEY =
   process.env.ONECLI_API_KEY || envConfig.ONECLI_API_KEY;
 export const GWS_ONECLI_SECRET_ID =
   process.env.GWS_ONECLI_SECRET_ID || envConfig.GWS_ONECLI_SECRET_ID || '';
-export const CREDENTIAL_PROXY_PORT = parseInt(
-  process.env.CREDENTIAL_PROXY_PORT || '3001',
-  10,
-);
 export const MAX_MESSAGES_PER_PROMPT = Math.max(
   1,
   parseInt(process.env.MAX_MESSAGES_PER_PROMPT || '10', 10) || 10,
